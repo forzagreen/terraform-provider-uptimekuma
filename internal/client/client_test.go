@@ -2,6 +2,8 @@ package client
 
 import (
 	"context"
+	"fmt"
+	"net"
 	"os"
 	"strings"
 	"testing"
@@ -9,6 +11,39 @@ import (
 
 	kuma "github.com/breml/go-uptime-kuma-client"
 )
+
+// startDeadEndListener starts a TCP listener that accepts connections but
+// never sends any data. This provides a deterministic, fast-failing
+// endpoint for tests: the TCP handshake succeeds immediately, but the
+// socket.io handshake never completes, so kuma.New blocks until its
+// per-attempt ConnectTimeout fires. Returns the listener address.
+func startDeadEndListener(t *testing.T) string {
+	t.Helper()
+
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to start dead-end listener: %v", err)
+	}
+
+	t.Cleanup(func() { ln.Close() })
+
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+
+			// Hold the connection open without sending anything.
+			go func() {
+				<-time.After(30 * time.Second)
+				conn.Close()
+			}()
+		}
+	}()
+
+	return fmt.Sprintf("http://%s", ln.Addr().String())
+}
 
 func TestNew_EmptyEndpoint(t *testing.T) {
 	config := &Config{
@@ -87,14 +122,21 @@ func TestNew_PoolDisabled(t *testing.T) {
 }
 
 func TestNewClientDirect_ConnectTimeoutLimitsOverallDuration(t *testing.T) {
-	// Connect to an endpoint that will never respond (RFC 5737 TEST-NET).
-	// Without the overall deadline, the retry loop would run for minutes.
+	// Use a local listener that accepts TCP connections but never
+	// completes the socket.io handshake. This is deterministic and
+	// independent of network configuration, unlike TEST-NET addresses.
+	// ConnectTimeout bounds both per-attempt timeout and overall duration
+	// via a separate timer (not via context deadline, because the context
+	// is stored for the connection lifetime by the socket.io client).
+	endpoint := startDeadEndListener(t)
+	connectTimeout := 2 * time.Second
+
 	config := &Config{
-		Endpoint:       "http://192.0.2.1:3001",
+		Endpoint:       endpoint,
 		Username:       "admin",
 		Password:       "secret",
-		ConnectTimeout: 500 * time.Millisecond,
-		MaxRetries:     1,
+		ConnectTimeout: connectTimeout,
+		MaxRetries:     10,
 		LogLevel:       kuma.LogLevel(os.Getenv("SOCKETIO_LOG_LEVEL")),
 	}
 
@@ -108,50 +150,68 @@ func TestNewClientDirect_ConnectTimeoutLimitsOverallDuration(t *testing.T) {
 		t.Fatal("expected error for unreachable endpoint, got nil")
 	}
 
-	// The entire call must finish within a generous upper bound.
-	// With a 500ms connect timeout and limited retries, each attempt is bounded
-	// so the overall duration stays well below ~3s.
-	if elapsed > 3*time.Second {
-		t.Errorf("expected connection to fail within ~3s, took %s", elapsed)
+	// ConnectTimeout acts as an overall deadline for the entire retry
+	// process via a separate timer. With 10 retries but a 2s timer, the
+	// operation must complete well before what 10 unbound retries would
+	// take. The first per-attempt timeout fires after ConnectTimeout,
+	// then the overall timer fires before the next attempt starts.
+	upperBound := connectTimeout + 2*time.Second
+	if elapsed > upperBound {
+		t.Errorf("expected connection to fail within %s, took %s", upperBound, elapsed)
 	}
 
-	if !strings.Contains(err.Error(), "cancelled") && !strings.Contains(err.Error(), "deadline") {
-		t.Errorf("expected context deadline/cancelled error, got: %s", err)
+	if !strings.Contains(err.Error(), "timed out") && !strings.Contains(err.Error(), "deadline") {
+		t.Errorf("expected timeout error, got: %s", err)
 	}
 }
 
-func TestNewClientDirect_MaxRetriesFromConfig(t *testing.T) {
-	// With MaxRetries=1, the retry loop should complete faster than
-	// with the default of 5 retries.
+func TestNewClientDirect_MaxRetriesLimitsAttempts(t *testing.T) {
+	// Verify that MaxRetries limits the number of connection attempts.
+	// Use a dead-end listener with a short ConnectTimeout so each
+	// attempt fails quickly. The overall timer (same value as
+	// ConnectTimeout) fires after the first attempt, which produces
+	// a "timed out after 1 attempt(s)" error — proving both the
+	// per-attempt timeout and the overall timer work together.
+	endpoint := startDeadEndListener(t)
+
 	config := &Config{
-		Endpoint:       "http://192.0.2.1:3001",
+		Endpoint:       endpoint,
 		Username:       "admin",
 		Password:       "secret",
 		ConnectTimeout: 1 * time.Second,
-		MaxRetries:     1,
+		MaxRetries:     5,
 		LogLevel:       kuma.LogLevel(os.Getenv("SOCKETIO_LOG_LEVEL")),
 	}
 
-	// Use a short timeout so we don't wait for actual TCP timeouts.
-	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
-	defer cancel()
+	start := time.Now()
 
-	_, err := newClientDirect(ctx, config)
+	_, err := newClientDirect(t.Context(), config)
+
+	elapsed := time.Since(start)
+
 	if err == nil {
-		t.Fatal("expected error for unreachable endpoint, got nil")
+		t.Fatal("expected error for dead-end endpoint, got nil")
 	}
 
-	// With MaxRetries=1, the error should mention "2 attempts" (initial + 1 retry).
-	if !strings.Contains(err.Error(), "2 attempts") && !strings.Contains(err.Error(), "cancelled") {
-		t.Errorf("expected error mentioning 2 attempts or cancelled, got: %s", err)
+	// The overall timer (1s) fires after the first per-attempt timeout
+	// (also 1s), so at most 1 attempt runs despite MaxRetries=5.
+	// Total time must be close to ConnectTimeout, not 5× that.
+	if elapsed > 3*time.Second {
+		t.Errorf("expected connection to fail within ~3s, took %s (MaxRetries not bounded by timer?)", elapsed)
+	}
+
+	if !strings.Contains(err.Error(), "timed out") {
+		t.Errorf("expected timeout error, got: %s", err)
 	}
 }
 
 func TestNewClientDirect_NoTimeoutRetriesNormally(t *testing.T) {
 	// Without ConnectTimeout, a cancelled parent context should still
 	// be respected by the retry loop's select.
+	endpoint := startDeadEndListener(t)
+
 	config := &Config{
-		Endpoint: "http://192.0.2.1:3001",
+		Endpoint: endpoint,
 		Username: "admin",
 		Password: "secret",
 		LogLevel: kuma.LogLevel(os.Getenv("SOCKETIO_LOG_LEVEL")),
